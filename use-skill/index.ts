@@ -23,6 +23,24 @@ export const STATE_CUSTOM_TYPE = "use-skill-state";
 
 // ── Pure logic (exported for testing) ───────────────────────────
 
+// Allow certain patterns that could potentially be useful for the agent.
+export function isLLMRelevant(path: string): boolean {
+  // llm.txt, llms.txt, llm-docs/
+  if (path.startsWith("llm")) {
+    return true;
+  }
+  if (["ai.txt", "robots.txt"].includes(path)) {
+    return true;
+  }
+  return false;
+}
+
+// Allow all .md files that are usually informational and could be relevant to the task.
+// Examples: README.md, SPEC.md, PICKUP.md, HANDOFF.md.
+export function isMDFile(path: string): boolean {
+  return path.endsWith(".md");
+}
+
 /**
  * Check if a read target is a skill file.
  *
@@ -81,11 +99,14 @@ export default function (pi: ExtensionAPI): void {
 
 		// Only `read` on a SKILL.md is allowed; everything else blocked
 		if (event.toolName === "read") {
-			const path = (event.input as { path?: string }).path ?? "";
+      const path = (event.input as { path?: string }).path ?? "";
 			if (isSkillFile(path)) {
 				skillRead = true;
 				pi.appendEntry(STATE_CUSTOM_TYPE, { skillRead: true });
 				return;
+      } else if (isLLMRelevant(path) || isMDFile(path)) {
+        // allow the read, but don't clear the `skillRead` flag
+        return;
 			}
 		}
 

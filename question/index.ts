@@ -1,42 +1,20 @@
 /**
  * question — ask the user a multiple-choice question via interactive select menu.
  *
- * - Inline dialog in execute(): no queue, no agent_settled steer messages.
+ * - Supports 1–4 parallel questions as stacked select panels in a TUI overlay.
  * - "Other" is automatically appended to choices, with dedup.
  * - executionMode "sequential" prevents batching with side-effect tools.
  * - Gated by ctx.hasUI — naturally unavailable to subagents (JSON mode).
+ * - autoExpire: true auto-dismisses after 30s (cancelled on first input).
+ * - Optional multiSelect per question (toggle options, confirm to finalize).
  */
 
-import { Text } from "@earendil-works/pi-tui";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-
-export interface QuestionDetails {
-	question: string;
-	answer?: string;
-	cancelled: boolean;
-	planModeDisengaged?: boolean;
-}
-
-// ── Pure helpers ───────────────────────────────────────────────
-
-/**
- * Build the final options array: deduplicates and ensures "Other" is always present.
- */
-export function buildOptions(options: string[]): string[] {
-	const result = options.filter((opt, i) => options.indexOf(opt) === i);
-	if (!result.includes("Other")) result.push("Other");
-	return result;
-}
-
-/** Pure string content for renderCall — no theme/pi-tui deps. */
-export function formatToolCall(question: string, options: string[]): string {
-	let text = `question ${question}`;
-	for (const opt of options) {
-		text += `\n  • ${opt}`;
-	}
-	return text;
-}
+import { Box, Text } from "@earendil-works/pi-tui";
+import type { QuestionInput, QuestionDetails, QuestionAnswer } from "./logic.ts";
+import { AUTO_EXPIRE_SECONDS, formatToolCall, formatMultiToolCall, formatAnswer } from "./logic.ts";
+import { MultiQuestionComponent } from "./component.ts";
 
 // ── Extension entry point ──────────────────────────────────────
 
@@ -46,38 +24,68 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 		name: "question",
 		label: "Question",
 		description:
-			"Ask the user a multiple-choice question via an interactive select menu. " +
-			"An 'Other' option is always included so the user can type free-form text.",
+			"Ask the user one or more multiple-choice questions via an interactive select menu. " +
+			"Pass up to 4 questions in the `questions` array to ask them all at once. " +
+			"An 'Other' option is always included so the user can type free-form text. " +
+			"Also known as AskUserQuestion or request_user_input in other contexts.",
 		promptSnippet:
-			"Use `question` when you need the user to make a decision or provide custom input.",
+			"Use `question` (also called AskUserQuestion or request_user_input) when you need the user to make a decision or provide custom input. " +
+			"Pass up to 4 questions in the `questions` array to ask them all at once.",
 		promptGuidelines: [
-			"Call `question` when you need the user to make a decision from a set of options, or to provide custom free-form input.",
-			"Pass a clear question and at least one option.",
+			"Call `question` (also known as AskUserQuestion or request_user_input) when you need the user to make a decision from a set of options, or to provide custom free-form input.",
+			"Pass up to 4 questions in the `questions` array to ask them all at once.",
+			"Each question must have a clear question string and at least one option.",
 			"An 'Other' option is automatically appended for free text input — do not add it yourself.",
 			"Use `optionsMeta` with `clearPlanMode: true` on the approval option to disengage plan-mode (??) when the user approves.",
+			"Use `multiSelect: true` on a question to allow the user to select multiple options (toggle with Space, confirm with Enter).",
+			"Use `autoExpire: true` to auto-dismiss the questions after 30 seconds of inactivity — cancelled on first user input.",
 		],
 		executionMode: "sequential",
 		parameters: Type.Object({
-			question: Type.String({
-				description: "The question to ask the user.",
-			}),
-			options: Type.Array(Type.String(), {
-				minItems: 1,
-				description:
-					"The multiple-choice options to present. Must include at least one option.",
-			}),
-			optionsMeta: Type.Optional(
-				Type.Record(
-					Type.String(),
-					Type.Object({
-						clearPlanMode: Type.Optional(Type.Boolean({
-							description:
-								"If true and user selects this option, plan-mode (??) is disengaged, " +
-								"allowing edit/write tools on subsequent turns.",
-						})),
+			questions: Type.Array(
+				Type.Object({
+					question: Type.String({ description: "The question to ask the user." }),
+					options: Type.Array(Type.String(), {
+						minItems: 1,
+						description: "The multiple-choice options to present. Must include at least one option.",
 					}),
-					{ description: "Per-option metadata keyed by option label." },
-				),
+					optionsMeta: Type.Optional(
+						Type.Record(
+							Type.String(),
+							Type.Object({
+								clearPlanMode: Type.Optional(
+									Type.Boolean({
+										description:
+											"If true and user selects this option, plan-mode (??) is disengaged, " +
+											"allowing edit/write tools on subsequent turns.",
+									}),
+								),
+							}),
+							{ description: "Per-option metadata keyed by option label." },
+						),
+					),
+					multiSelect: Type.Optional(
+						Type.Boolean({
+							description:
+								"If true, user can select multiple options (toggle with Space, confirm with Enter). " +
+								"Default is false (single selection).",
+						}),
+					),
+				}),
+				{
+					minItems: 1,
+					maxItems: 4,
+					description: "1–4 questions to ask the user in parallel.",
+				},
+			),
+			autoExpire: Type.Optional(
+				Type.Boolean({
+					default: false,
+					description:
+						"If true, auto-dismiss the questions after 30 seconds of inactivity. " +
+						"Timer is cancelled as soon as user provides any input. " +
+						"Default false.",
+				}),
 			),
 		}),
 		execute: async (_toolCallId, params, _signal, _onUpdate, ctx) => {
@@ -89,123 +97,207 @@ export default async function (pi: ExtensionAPI): Promise<void> {
 							text: "Question requires interactive mode — cannot present without UI.",
 						},
 					],
-					details: { question: params.question, cancelled: true } satisfies QuestionDetails,
+					details: (params.questions ?? []).map((q) => ({
+						question: q.question,
+						cancelled: true,
+						planModeDisengaged: false,
+					})) satisfies QuestionDetails[],
 				};
 			}
 
-			// Build display labels: append [clears plan-mode] for options with clearPlanMode
-			const displayToOriginal = new Map<string, string>();
-			const displayLabels = params.options.map((opt) => {
-				const meta = params.optionsMeta?.[opt];
-				const display = meta?.clearPlanMode ? `${opt} [clears plan-mode]` : opt;
-				displayToOriginal.set(display, opt);
-				return display;
+			const questions: QuestionInput[] = params.questions ?? [];
+			const autoExpire = params.autoExpire === true;
+			const timerSeconds = autoExpire ? AUTO_EXPIRE_SECONDS : 0;
+
+			// ── Show stacked overlay (always, even for 1 question) ───────
+			pi.events.emit("notify:alert", undefined);
+
+			// Timer state
+			let timerHandle: ReturnType<typeof setTimeout> | null = null;
+			let timerCancelled = false;
+			let customDoneRef: ((result: QuestionAnswer[] | undefined) => void) | null = null;
+
+			// Create a promise that resolves when the UI is done
+			let uiResolve: ((result: QuestionAnswer[] | undefined) => void) | null = null;
+			const uiPromise = new Promise<QuestionAnswer[] | undefined>((resolve) => {
+				uiResolve = resolve;
 			});
 
-			const allOptions = buildOptions(displayLabels);
+			// Show the UI — factory runs synchronously, setting customDoneRef
+			ctx.ui.custom<QuestionAnswer[] | undefined>(
+				(_, theme, _kb, customDone) => {
+					customDoneRef = customDone;
 
-			// Ask notify extension to alert the user (bell if terminal unfocused)
-			pi.events.emit("notify:alert");
-
-			const selection = await ctx.ui.select(params.question, allOptions);
-
-			if (selection === undefined) {
-				return {
-					content: [
-						{
-							type: "text" as const,
-							text: "Question dismissed by the user without an answer.",
-						},
-					],
-					details: { question: params.question, cancelled: true } satisfies QuestionDetails,
-				};
-			}
-
-			if (selection === "Other") {
-				const freeText = await ctx.ui.input(params.question, "Type your answer…");
-
-				if (freeText === undefined) {
-					return {
-						content: [
-							{
-								type: "text" as const,
-								text: "Question dismissed by the user without an answer.",
-							},
-						],
-						details: { question: params.question, cancelled: true } satisfies QuestionDetails,
+					const wrappedDone = (result: QuestionAnswer[] | undefined) => {
+						// Cancel timer on completion
+						if (timerHandle) {
+							clearTimeout(timerHandle);
+							timerHandle = null;
+						}
+						customDone(result);
+						uiResolve?.(result);
 					};
-				}
 
+					const onFirstInput = () => {
+						// Cancel timer on first user input
+						if (timerHandle && !timerCancelled) {
+							clearTimeout(timerHandle);
+							timerHandle = null;
+						}
+					};
+
+					const mqc = new MultiQuestionComponent(questions, wrappedDone, theme, onFirstInput, timerSeconds);
+					// Use userMessageBg (dark gray) for overlay to stay distinct from
+					// the blue toolPendingBg used for session-history tool calls
+					const bgFn = (text: string) => theme.bg("customMessageBg", text);
+					const box = new Box(0, 0, bgFn);
+					box.addChild(mqc);
+					return Object.assign(box, {
+						handleInput: (data: string) => mqc.handleInput(data),
+					});
+				},
+				{ overlay: true, overlayOptions: { width: "75%", maxHeight: "75%" } },
+			);
+
+			// Set up timer BEFORE awaiting UI promise (so timer can fire during dialog)
+			if (timerSeconds && timerSeconds > 0) {
+				timerHandle = setTimeout(() => {
+					timerCancelled = true;
+					timerHandle = null;
+					// Close the overlay by calling customDone
+					customDoneRef?.(undefined);
+					uiResolve?.(undefined);
+				}, timerSeconds * 1000);
+			}
+
+			// Wait for UI completion
+			const rawAnswers = await uiPromise;
+
+			if (rawAnswers === undefined) {
+				const timedOut = timerCancelled;
 				return {
-					content: [{ type: "text" as const, text: freeText }],
-					details: {
-						question: params.question,
-						answer: freeText,
-						cancelled: false,
-					} satisfies QuestionDetails,
+					content: [{
+						type: "text" as const,
+						text: timedOut
+							? "Questions timed out after 30s without user input."
+							: "Questions dismissed by the user without an answer.",
+					}],
+					details: questions.map((q) => ({
+						question: q.question,
+						cancelled: true,
+						planModeDisengaged: false,
+						timedOut,
+					})) satisfies QuestionDetails[],
 				};
 			}
 
-			// Map display label back to original option for metadata lookup
-			const original = displayToOriginal.get(selection) ?? selection;
+			// Inline text-input handled "Other" within the overlay — no post-resolution needed.
+			const details: QuestionDetails[] = [];
+			let anyClearPlanMode = false;
 
-			// Check if this option has plan-mode clearing metadata
-			const clearPlanMode = params.optionsMeta?.[original]?.clearPlanMode === true;
-			if (clearPlanMode) {
-				pi.events.emit("plan-mode:disengage");
+			for (let i = 0; i < questions.length; i++) {
+				const q = questions[i];
+				const ans = rawAnswers[i];
+				if (ans.clearPlanMode) anyClearPlanMode = true;
+				details.push({
+					question: q.question,
+					answer: ans.answer,
+					cancelled: false,
+					planModeDisengaged: ans.clearPlanMode,
+				});
 			}
+
+			if (anyClearPlanMode) pi.events.emit("plan-mode:disengage", undefined);
+
+			const answeredText = details
+				.map((d) => {
+					if (d.cancelled) return `✗ ${d.question}`;
+					const ans = formatAnswer(d.answer!);
+					return `✓ ${ans}`;
+				})
+				.join("\n");
 
 			return {
-				content: [{
-					type: "text" as const,
-					text: clearPlanMode
-						? `${original} (plan-mode disengaged)`
-						: original,
-				}],
-				details: {
-					question: params.question,
-					answer: original,
-					cancelled: false,
-					planModeDisengaged: clearPlanMode,
-				} satisfies QuestionDetails,
+				content: [{ type: "text" as const, text: answeredText }],
+				details,
 			};
 		},
 
+		// ── renderers ────────────────────────────────────────────
+
 		renderCall(args, theme) {
-			const question = (args.question as string) || "";
-			const rawOptions = args.options as string[] | undefined;
-			const options = rawOptions ?? [];
-			const content = formatToolCall(question, options);
-			// Re-apply theme to the plain format
-			const [_firstLine, ...rest] = content.split("\n");
-			let text = theme.fg("toolTitle", theme.bold("question ")) + theme.fg("text", question);
-			for (const line of rest) {
-				text += "\n" + theme.fg("dim", line);
+			const rawQuestions = args.questions as QuestionInput[] | undefined;
+			const autoExpire = args.autoExpire;
+			if (!rawQuestions || rawQuestions.length === 0) {
+				return new Text("question (empty)", 0, 0);
 			}
-			return new Text(text, 0, 0);
-		},
 
-		renderResult(result, options, theme) {
-			const details = result.details as QuestionDetails | undefined;
-
-			if (!details || details.cancelled) {
-				let text = theme.fg("error", "✗ ");
-				text += theme.fg("accent", details?.question ?? "Cancelled");
+			if (rawQuestions.length === 1) {
+				const q = rawQuestions[0];
+				const content = formatToolCall(q.question, q.options ?? [], q.multiSelect);
+				const [, ...rest] = content.split("\n");
+				let text = theme.fg("toolTitle", theme.bold("question ")) + theme.fg("text", q.question);
+				if (q.multiSelect) text += theme.fg("dim", " [multi-select]");
+				for (const line of rest) {
+					text += "\n" + theme.fg("dim", line);
+				}
+				if (autoExpire) text += "\n" + theme.fg("dim", "  ⏱ auto-expire (30s)");
 				return new Text(text, 0, 0);
 			}
 
-			let text = theme.fg("success", "✓ ");
-			text += theme.fg("accent", details.answer ?? "");
+			// Multiple questions
+			const text = formatMultiToolCall(rawQuestions);
+			const lines = text.split("\n");
+			let result = "";
+			for (const line of lines) {
+				if (result) result += "\n";
+				if (line.startsWith("Q")) {
+					result += theme.fg("toolTitle", theme.bold(line));
+				} else {
+					result += theme.fg("dim", line);
+				}
+			}
+			if (autoExpire) result += "\n" + theme.fg("dim", "⏱ auto-expire (30s)");
+			return new Text(result, 0, 0);
+		},
 
-			if (details.planModeDisengaged) {
-				text += " " + theme.fg("warning", "🔓 plan-mode disengaged");
+		renderResult(result, options, theme) {
+			const details = result.details as QuestionDetails[] | undefined;
+
+			if (!details || details.length === 0) {
+				return new Text(theme.fg("error", "✗ Cancelled"), 0, 0);
 			}
 
-			if (options.expanded) {
-				text += "\n" + theme.fg("dim", `Q: ${details.question}`);
+			if (details.length === 1) {
+				// Single answer — existing compact format
+				const d = details[0];
+				if (d.cancelled) {
+					const reason = d.timedOut ? " (timed out)" : "";
+					return new Text(theme.fg("error", "✗ ") + theme.fg("accent", d.question) + theme.fg("dim", reason), 0, 0);
+				}
+				const ans = formatAnswer(d.answer!);
+				let text = theme.fg("success", "✓ ") + theme.fg("accent", ans);
+				if (d.planModeDisengaged) text += " " + theme.fg("warning", "🔓 plan-mode disengaged");
+				if (options.expanded) text += "\n" + theme.fg("dim", `Q: ${d.question}`);
+				return new Text(text, 0, 0);
 			}
 
-			return new Text(text, 0, 0);
+			return new Text(
+				details
+					.map((d) => {
+						if (d.cancelled) {
+							const reason = d.timedOut ? " (timed out)" : "";
+							return theme.fg("error", "✗ ") + theme.fg("accent", d.question) + theme.fg("dim", reason);
+						}
+						const ans = formatAnswer(d.answer!);
+						let line = theme.fg("success", "✓ ") + theme.fg("accent", ans)
+							+ (d.planModeDisengaged ? " " + theme.fg("warning", "🔓") : "");
+						if (options.expanded) line += "\n" + theme.fg("dim", `  Q: ${d.question}`);
+						return line;
+					})
+					.join("\n"),
+				0, 0,
+			);
 		},
 	});
 }
